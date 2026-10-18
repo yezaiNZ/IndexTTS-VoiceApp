@@ -1,0 +1,12 @@
+# Pin API/audio additions without replacing IndexTTS's locked numpy/scipy stack.
+fastapi==0.141.1
+starlette==1.6.0
+uvicorn==0.53.0
+sounddevice==0.5.6
+h11==0.16.0
+anyio==4.15.1
+pydantic==2.13.5
+pydantic-core==2.46.5
+typing-inspection==0.4.4
+annotated-doc==0.0.5
+annotated-types==0.8.0

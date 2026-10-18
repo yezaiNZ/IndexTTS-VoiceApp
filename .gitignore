@@ -1,0 +1,36 @@
+.venv/
+.uv-cache/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+outputs/
+presets/
+build/
+release/
+dist/
+*.spec
+
+# Local secrets and diagnostic logs (never publish real credentials).
+.env
+.env.*
+!.env.example
+*.log
+
+# Inference environments, models, private audio and release binaries.
+.uv-python/
+.voice-app-venv/
+checkpoints/
+*.pt
+*.pth
+*.safetensors
+*.onnx
+*.wav
+*.ogg
+*.mp3
+*.flac
+*.m4a
+*.whl
+*.exe
+*.zip

@@ -1,0 +1,247 @@
+# IndexTTS Voice App
+
+> 开发预览版：核心生成与混音链路已做本机测试，但尚未完成多台干净 Windows 电脑上的
+> 安装兼容性验证。当前仍有生成等待时间偏长等已知限制；界面自然闪退的触发原因也尚未定位。
+> 日常更新以源码为主，安装包按阶段提供，不代表每次提交都有对应的安装程序。
+
+这是一个独立的 Windows 桌面语音项目：把真人麦克风与 IndexTTS 2.5 的生成语音
+混合后送入 VB-CABLE，供 TeamSpeak、QQ 等语音软件使用。
+
+安装向导会自动准备 Python、CUDA 推理依赖与全部必需模型，并真实加载模型验证，
+通过后才进入主界面。普通用户不需要另装 IndexTTS、Python 或手动配置环境。
+已有环境也可自动检查和补齐。版本号：**0.4.5**。
+
+0.4.5 调整生成音频保留方式：默认只输出、不自动写 WAV 文件；桌面只在内存中
+保留上一条，想留存时点“另存上一条”。可选开启自动保存，默认上限 500 MB，
+超限清理专用目录中最早的自动保存音频。手动另存、参考音频和旧版输出文件不参与清理。
+
+0.4.4 增加安装升级检查：列出经过产品卸载记录验证的旧版，用户确认后调用旧版
+卸载器，只移除旧程序，再装入名称与新版本一致的目录。默认沿用旧版的盘符与父目录。
+已安装的引擎、模型和个人配置保留；旧版仍在运行或接口端口被占用时，暂停升级，
+不会按名称强制结束进程。拒绝降级，也不直接删除整个文件夹。
+
+0.4.3 修复界面异常退出后后台残留的问题。界面启动的服务使用 Windows
+kill-on-close Job 绑定，且在开始服务前建立父进程身份/句柄监控；界面闪退或被
+任务管理器结束时，专属后台会随之结束并释放端口、显存和音频设备。
+正常退出也会在事件循环返回时再次清理。独立启动的接口服务不受这个绑定影响。
+本版不声称已经定位或修复导致 Qt 界面自然闪退的具体原因，也未改动角色/路由选择逻辑。
+
+0.4.2 修复 Windows 拒绝 Python 版本目录链接（错误 448）导致环境无法启动的问题。
+仅指定安装时的 Python 路径还不够：uv 创建的可升级环境可能仍嵌入版本目录链接。
+新版使用固定 Python 3.11.16 本体，通过标准库 venv 的复制模式准备启动器；
+同步依赖前后均运行真实启动检查，确认环境绑定实际 Python 路径，而非版本目录链接。
+应用环境独立存放在 `.voice-app-venv`，修复时保留其中的依赖和已有模型；
+旧版 IndexTTS 的 `.venv` 不会被替换。不需要关闭 Windows 安全保护或以管理员身份运行前端。
+安装路径包含空格或中文时，后端依赖清单以编码后的文件 URI 传入，避免路径被拆分。
+
+发布包附带固定版本的 IndexTTS 源码、uv 和可选的官方 VB-CABLE 驱动原始归档；
+不包含大模型或个人角色参考音频。组件来源与许可见 [THIRD_PARTY.md](THIRD_PARTY.md)。
+
+## 首次安装
+
+1. 运行 `IndexTTSVoiceApp-Setup-0.4.5.exe`。安装器复制程序后直接进入语音引擎准备流程。
+2. 保持“自动安装”，确认保存位置，阅读并同意上游许可，点击“下载并安装”。
+3. 程序自动安装独立 Python 与锁定版本的 CUDA 推理库，检查显卡，下载并校验完整模型，
+   最后真实加载语音引擎。未通过检查不会显示为准备完成，也不会开放生成按钮。
+4. 进入主界面，选择自己的参考音频或角色预设、输入文字即可生成。
+
+首次需要网络和可用的 NVIDIA CUDA 显卡/驱动，建议在引擎磁盘预留至少 **25 GB**。
+必需模型约 **7.1 GB（6.6 GiB）**，包含 w2v-BERT、CAMPPlus、BigVGAN 和两份特征文件，
+不是只下载主模型。程序安装 Python/CUDA 推理库，不自动安装或升级 NVIDIA 显卡驱动。
+下载自动选择 ModelScope、Hugging Face 或校验镜像，所有模型内容必须与固定 SHA-256 一致。
+网络中断可点击重试或下次继续，已完成文件不用重新下载。
+
+可勾选“同时安装 VB-CABLE”，由程序打开已校验的官方驱动安装器；需要用户允许 Windows
+管理员确认、按官方界面安装，可能需要重启。这一步不是静默安装。已有 VB-CABLE 不会重复安装，
+暂不装驱动也可直接使用本地耳机试听。接收语音的软件中仍需选一次 `CABLE Output` 作为麦克风。
+
+便携版解压 `IndexTTSVoiceApp-portable-0.4.5.zip` 后运行 `IndexTTSVoiceApp.exe`，
+使用相同的自动准备流程。“便携”指前端免安装，不代表模型和推理环境免下载。
+安装记录位于 `%LOCALAPPDATA%\IndexTTSVoiceApp\setup.log`，运行记录为同目录的 `backend.log`。
+
+首次设置窗口选择的是 **IndexTTS 2.5 引擎目录**，不是 Voice App 程序安装目录；
+自动安装时新目录命名为 `IndexTTS-2.5-engine`。发布包则放在带 Voice App
+版本号的文件夹中，例如 `IndexTTS-VoiceApp-v0.4.5`。升级应用不会改变已安装
+引擎的位置。
+前端默认安装文件夹为 `IndexTTS Voice App v0.4.5`，不再把新版本装进名称含旧版本的目录。
+源码仓库的位置保持不变，版本以 `pyproject.toml` 和 Git 版本记录为准。
+
+## 升级与旧版清理
+
+运行新版安装程序后，如果检测到旧版，会先显示版本及完整路径。确认升级后，
+安装器调用每个旧版自己的卸载器，而非递归删除文件夹；旧目录若留有个人文件会保留。
+默认新目录与旧版相邻，例如 `D:\Apps\IndexTTS Voice App v0.4.5`。
+请先关闭应用、引擎准备窗口和独立接口服务。
+
+检测包括当前用户/整机安装记录，以及本机固定磁盘根目录、默认程序目录和已识别安装的
+相邻目录里的本软件卸载记录；不会全盘递归搜索。没有有效卸载记录的便携版、任意位置的
+手动副本或被破坏的旧安装无法保证自动发现，也不会被自动删除。源码和引擎目录不作为
+清理目标。若旧版曾以管理员权限安装，卸载时 Windows 可能要求管理员确认。
+
+同版本可重装修复，旧安装包不能覆盖已检测到的更高版本。静默升级还必须显式传入
+`/UPGRADE=1`；未确认时旧版不动。新版首次启动会继续复用原引擎并更新配套后端、验证模型，
+已校验的模型无需重新下载。若下载/检查被中断，重新打开应用继续修复。
+
+自动安装会固定使用经过本项目测试的 [IndexTTS 源码版本](https://github.com/index-tts/index-tts/tree/ee40fa7d6c6b8a2c7f06105f9f1e65775b74868c)
+和 [官方模型](https://huggingface.co/IndexTeam/IndexTTS-2.5)；备用下载来自
+[IndexTeam 在 ModelScope 的同名模型](https://www.modelscope.cn/models/IndexTeam/IndexTTS-2.5)。
+全部默认推理必需的辅助模型也在安装阶段准备；后端启动后采用离线模型加载，
+不等到第一次生成才临时下载。可选的 Qwen 情绪文字模型不属于当前默认功能。
+
+已有可运行的 IndexTTS 2.5 也可以直接复用：在向导选择“使用已有的 IndexTTS
+环境”，指定包含 `indextts/infer_v2_5.py` 与 `.venv/Scripts/python.exe` 的目录。
+程序会检查显卡、补齐模型与后端依赖，不替换用户提供的源码。残缺的旧版托管环境
+推荐直接选择“自动安装”，由程序同步推理依赖并续传缺失文件；不需要先删除旧环境。
+
+源码用户先安装 [uv](https://docs.astral.sh/uv/getting-started/installation/)，然后
+双击 `setup_voice_app.bat`。它会在 Voice App 自己的 `.venv` 中安装桌面界面；
+双击 `start_voice_app.bat` 后完成首次启动向导。
+
+## 启动
+
+发布包从开始菜单启动，源码模式双击 `start_voice_app.bat`。
+
+桌面界面使用现代化的 PySide6 卡片式界面，会优先选择带有 `VB-CABLE 推荐` 标记的 MME 输出设备。勾选“真人麦克风
+透传”后，应用会持续把物理麦克风与生成的角色语音混合到 VB-CABLE；勾选“同时
+本地监听”后，还可以另选耳机或扬声器收听角色语音。
+
+QQ 等目标软件始终只需要把麦克风设为 `CABLE Output`。这样无需在 QQ 内切换设备：
+平时说话来自所选物理麦克风，点击生成时角色语音会叠加进同一条虚拟麦克风通道。
+
+界面与本地推理服务运行在不同进程，关闭界面时会关闭它启动的服务。请勿同时运行
+原 WebUI；它会另行加载一份模型。
+
+## 目录职责
+
+### 生成音频是否保留
+
+- 默认不自动保存音频；旧设置没有保存开关时，也采用关闭状态。日志和必要配置仍会写入磁盘。
+- 桌面在内存中仅暂存上一条生成 PCM（最多 64 MB），点击“另存上一条”选择位置导出 WAV。
+  再次开始生成或关闭应用会丢弃上一条临时音频，超出内存上限则不提供另存，语音输出继续。
+- 需要批量留存时勾选“自动保存音频”，选择保留上限；点击“记住选项”立即保存设置，
+  或正常生成时一并保存。界面提供 100 MB、500 MB、1 GB、2 GB 等选项。
+- 自动保存到 `%LOCALAPPDATA%\IndexTTSVoiceApp\outputs\auto-saved`，每次成功生成后
+  按最早文件优先清理，使该目录中受管理的已完成 WAV 总量不超过所选上限。
+  生成中临时文件可能暂时多占一条的空间；单条超过上限时不保留，停止或出错的残缺音频会丢弃。
+  异常退出遗留的专用临时文件超过 24 小时后，在后续自动保存清理时尝试移除。
+  被其他程序占用的文件不会强行删除；无法腾出空间时，本条新音频可能不保留。
+- 保存失败不会中断语音输出，界面会提示未保存，仍可尝试手动另存。
+- 清理不递归、不处理手动另存、角色参考音频、模型、配置，也不清理旧版留在 `outputs`
+  根目录的历史文件。`tts-` 加 32 位任务号的 WAV 名称为自动缓存保留格式，手动另存需另取名字。
+- 小窗口中内容区可以滚动，底部生成/停止按钮仍保持可见。
+
+个人配置、预设与生成音频存于 `%LOCALAPPDATA%\IndexTTSVoiceApp\`。从旧版
+源码安装升级时，应用会在目标目录不存在的情况下复制原有 `presets` 和
+`outputs/settings.json`。这些用户文件不会被打包或上传。
+
+要重新选择 IndexTTS 目录，运行 `IndexTTSVoiceApp.exe --setup`；源码模式运行
+`python -m voice_app desktop --setup`。
+
+## 接口服务
+
+只启动本地接口：
+
+```powershell
+$indexTtsRoot = 'D:\AI\index-tts'  # 改成你自己的目录
+& "$indexTtsRoot\.venv\Scripts\python.exe" -m voice_app server `
+  --index-tts-root $indexTtsRoot --fp16
+```
+
+服务默认监听 `127.0.0.1:7862`，接口文档位于
+`http://127.0.0.1:7862/docs`。
+
+- `GET /health`：引擎、模型和当前任务状态。
+- `GET /v1/presets`：列出本项目 `presets` 中的角色。
+- `GET /v1/devices`：列出 Windows 输出设备并标记 VB-CABLE。
+- `GET /v1/input-devices`：列出 Windows 输入设备。
+- `GET /v1/mixer`：查看真人麦克风混音桥状态。
+- `POST /v1/mixer/start`：启动或更新麦克风与 TTS 的常驻混音桥。
+- `POST /v1/mixer/stop`：停止真人麦克风透传。
+- `POST /v1/model/load`：预加载唯一模型实例。
+- `POST /v1/tts`：完成生成后返回 WAV。
+- `POST /v1/tts/stream`：流式返回 22.05 kHz、单声道、16-bit little-endian PCM，
+  并同时输出到所选虚拟设备和可选监听设备。
+- `GET /v1/outputs/{job_id}`：生成结束后查询实际自动保存结果，最近 64 个任务有效。
+- `POST /v1/stop`：当前文本分段结束后停止任务。
+
+示例请求：
+
+```json
+{
+  "text": "你好，这是一次接口测试。",
+  "reference_audio": "C:\\Audio\\my-reference.wav",
+  "language": "ZH",
+  "output_device": 13,
+  "monitor_enabled": true,
+  "monitor_device": 9,
+  "generation": {
+    "top_p": 0.8,
+    "temperature": 0.8,
+    "max_text_tokens_per_segment": 120
+  }
+}
+```
+
+设备编号可能随 Windows 配置变化，请以 `GET /v1/devices` 或桌面下拉框为准。
+两个生成接口的 `save_output` 默认均为 `false`；`/v1/tts` 返回 WAV 响应，不再强制落盘。
+非流式响应最多在内存中组装 64 MB PCM，超出返回 413，长文本应改用流式接口。
+启用自动保存的客户端需显式传 `save_output: true`，保留上限读取保存设置 `output_limit_mb`。
+流响应头包含 `X-Job-Id`、PCM 格式以及启用保存时的候选 `X-Output-File`。
+候选路径不代表保存成功，结束后应查询 `/v1/outputs/{job_id}` 的 `saved/path/error`；
+磁盘错误或容量不足时仍正常输出语音，但不会谎报保存完成。清理过或移走的文件会返回未保留状态。
+
+## VB-CABLE 出现电流声
+
+优先选择下拉框中带有 `VB-CABLE 推荐` 的 MME 设备。应用会以 44.1 kHz、双声道、
+16-bit PCM 输出，并会把旧配置中的 WASAPI 或 DirectSound CABLE 自动切换到这一
+经过闭环录音验证的设备。
+
+如果其他软件中仍有电流声，请在 Windows“声音控制面板”中把 `CABLE Input` 和
+`CABLE Output` 的默认格式都设置成相同的 `2 声道、16 位、44100 Hz`，然后重新启动
+Voice App 和接收声音的软件。
+
+## 真人麦克风与角色语音同时使用
+
+1. 在“虚拟输出”中选择带 `VB-CABLE 推荐` 标记的设备。
+2. 在“真人麦克风透传”右侧选择真正使用的麦克风，不要选择 `CABLE Output`。
+3. 勾选“真人麦克风透传”，再点“应用混音设置”。
+4. 在 QQ、游戏或直播软件中将麦克风设为 `CABLE Output`。
+
+“真人音量”和“角色音量”可以分别调节。若两路同时说话时出现削波或破音，可把两者
+从 100% 各自下调到约 70%～85%。应用会禁止把 `CABLE Output` 当成真人麦克风，
+以免形成反馈回路。
+
+## 构建发布包
+
+在 Windows 上安装 uv 后运行 `build_release.ps1`。脚本会生成仅包含 Qt 界面的
+`release/IndexTTS-VoiceApp-v0.4.5/IndexTTSVoiceApp/`、便携 ZIP 和后端 wheel。如果安装了 Inno Setup 6，
+还会生成 Windows 安装程序。完整模型和个人参考音频不会进入发布包。
+
+上传 GitHub 前，建议在另一台 Windows 电脑上测试首次配置、依赖安装、设备选择、
+麦克风透传、生成、停止、关闭重启和卸载。只在 GitHub Releases 中发布构建出的
+安装程序或便携 ZIP；`presets/`、`outputs/`、`checkpoints/` 均属于用户私有数据。
+
+维护者可用最终打包的 EXE 做隔离安装验证（不走交互窗口、不输出到音频设备）：
+
+```powershell
+.\IndexTTSVoiceApp.exe --verify-install 'D:\Tests\voice-app-engine' `
+  --data-dir 'D:\Tests\voice-app-test-data' --reference-audio 'D:\Tests\reference.wav'
+```
+
+必须指定独立测试目录。验证会实际安装推理环境、加载模型、可选生成音频，
+结果写入该数据目录的 `verification.json`；不要指向正在使用的引擎。
+
+如果启动失败，可以查看 `%LOCALAPPDATA%\IndexTTSVoiceApp\backend.log`。遇到
+7862 端口占用时，先退出旧版 Voice App 再启动。
+
+## 验证边界
+
+运行 `pytest` 验证安装、下载恢复、文件清单、就绪状态和音频路由回归。
+在 Windows 明确设置 `VOICE_APP_INSTALLER_TESTS=1` 后运行
+`pytest tests/test_installer_upgrade.py -s`，会编译并执行使用独立测试产品标识的安装器，
+验证多旧版升级、静默确认、进程/端口占用、防降级、路径保护和数据保留。
+测试使用无执行能力的占位程序，不启动真实语音、不操作真实产品安装；证据保留于 `build`。
+`IndexTTSVoiceApp.exe --install --data-dir D:\VoiceApp-Test\user-data` 可使用隔离配置
+测试首次准备流程；请先关闭占用 7862 端口的旧实例。
+同一台开发电脑上的通过结果不能代替另一台干净 Windows 电脑的验证。
+联网安装仍受网络、驱动和磁盘条件影响，不承诺在任何机器上零故障。
