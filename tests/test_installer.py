@@ -10,7 +10,6 @@ from voice_app import __version__, downloads, engine_setup
 from voice_app.http_errors import check_response
 from voice_app.model_manifest import ALL_MODELS, MANIFEST_VERSION, ModelFile
 
-
 DATA = b"verified voice model"
 ITEM = ModelFile(
     "weights.bin",
@@ -239,7 +238,8 @@ def test_desktop_without_cable_uses_local_monitor(tmp_path, monkeypatch):
     window.reference.setEditText(str(tmp_path / "sample.wav"))
     payload = window._payload()
     assert payload["output_device"] is None
-    assert payload["monitor_enabled"] and payload["monitor_device"] == 9
+    assert payload["monitor_enabled"] and payload["monitor_device"] is None
+    assert window.monitor_device.currentText() == "跟随系统默认"
     assert not window._mixer_payload()["enabled"]
     assert window.generate_button.isEnabled()
     window.close()
@@ -254,6 +254,9 @@ def test_desktop_generation_disabled_until_model_ready(monkeypatch):
     window.generate()
     assert not window.generating
     window._model_loaded({"model_loaded": True})
+    assert not window.generate_button.isEnabled()
+    window.reference.setEditText("reference.wav")
+    window.text.setPlainText("测试")
     assert window.generate_button.isEnabled()
     window._model_error("missing model")
     assert not window.generate_button.isEnabled()

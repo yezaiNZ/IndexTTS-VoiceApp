@@ -1,0 +1,60 @@
+{
+  "qt_version": "6.11.2",
+  "uv_version": "0.12.17",
+  "python_version": "3.11.13",
+  "openssl_version": "3.5.4",
+  "artifacts": [
+    {
+      "component": "qtbase",
+      "name": "qtbase-everywhere-src-6.11.2.tar.xz",
+      "url": "https://download.qt.io/archive/qt/6.11/6.11.2/submodules/qtbase-everywhere-src-6.11.2.tar.xz",
+      "alternate_urls": [
+        "https://ftp.jaist.ac.jp/pub/qtproject/archive/qt/6.11/6.11.2/submodules/qtbase-everywhere-src-6.11.2.tar.xz",
+        "https://ftp.fau.de/qtproject/archive/qt/6.11/6.11.2/submodules/qtbase-everywhere-src-6.11.2.tar.xz"
+      ],
+      "size": 50582668,
+      "sha256": "5b2e00eccaf5a4d8c14134ffa0ea8dfd0a35ae1ffc7f8d87fa4305a1ed23cf22",
+      "source_archive": true
+    },
+    {
+      "component": "pyside-shiboken",
+      "name": "pyside-setup-everywhere-src-6.11.2.tar.xz",
+      "url": "https://download.qt.io/official_releases/QtForPython/pyside6/PySide6-6.11.2-src/pyside-setup-everywhere-src-6.11.2.tar.xz",
+      "size": 18053248,
+      "sha256": "cba47efbaad1bedd529725cbc14e21f156c7a19366f07b3edfbb076ffd7afdf8",
+      "source_archive": true
+    },
+    {
+      "component": "python",
+      "name": "CPython-3.11.13-THIRD-PARTY-LICENSES.rst",
+      "url": "https://raw.githubusercontent.com/python/cpython/v3.11.13/Doc/license.rst",
+      "size": 53753,
+      "sha256": "2b734ec5975b21b29ae8b9756a00fc3dfe701abe51687cec4c98a21c51005bca",
+      "source_archive": false
+    },
+    {
+      "component": "openssl",
+      "name": "OpenSSL-3.5.4-LICENSE.txt",
+      "url": "https://raw.githubusercontent.com/openssl/openssl/openssl-3.5.4/LICENSE.txt",
+      "size": 10175,
+      "sha256": "7d5450cb2d142651b8afa315b5f238efc805dad827d91ba367d8516bc9d49e7a",
+      "source_archive": false
+    },
+    {
+      "component": "uv",
+      "name": "uv-LICENSE-MIT.txt",
+      "url": "https://raw.githubusercontent.com/astral-sh/uv/0.12.17/LICENSE-MIT",
+      "size": 1077,
+      "sha256": "860e3d7a86b84e6a7012c7a635fc64df475cebc6cce34dfeb73a5982ec58176c",
+      "source_archive": false
+    },
+    {
+      "component": "uv",
+      "name": "uv-LICENSE-APACHE.txt",
+      "url": "https://raw.githubusercontent.com/astral-sh/uv/0.12.17/LICENSE-APACHE",
+      "size": 11357,
+      "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
+      "source_archive": false
+    }
+  ]
+}

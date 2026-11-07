@@ -1,15 +1,19 @@
 from __future__ import annotations
 
-from pathlib import Path
 import time
-from typing import Callable
+from collections.abc import Callable
+from pathlib import Path
 
 import requests
-
-from . import __version__
-from .http_errors import check_response
-from .output_store import LAST_AUDIO_LIMIT, write_wav_atomic
-from PySide6.QtCore import QObject, QRunnable, QThreadPool, Qt, Signal, Slot
+from PySide6.QtCore import (
+    QObject,
+    QRunnable,
+    QSignalBlocker,
+    Qt,
+    QThreadPool,
+    Signal,
+    Slot,
+)
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QApplication,
@@ -22,12 +26,20 @@ from PySide6.QtWidgets import (
     QLabel,
     QMainWindow,
     QPushButton,
-    QSlider,
     QScrollArea,
+    QSizePolicy,
+    QSlider,
     QTextEdit,
     QVBoxLayout,
     QWidget,
 )
+
+from . import __version__
+from .http_errors import check_response
+from .output_store import LAST_AUDIO_LIMIT, write_wav_atomic
+from .preset_dialog import PresetDialog
+from .qt_audio_choices import fill_local_devices, style_combo_popup
+from .third_party import show_third_party
 
 
 class _WorkerSignals(QObject):
@@ -45,7 +57,7 @@ class _Worker(QRunnable):
     def run(self):
         try:
             self.signals.result.emit(self.callback())
-        except Exception as exc:  # surfaced on the GUI thread
+        except Exception as exc:  # noqa: BLE001 - surface all worker failures on the GUI thread
             try:
                 self.signals.error.emit(str(exc))
             except RuntimeError:
@@ -72,8 +84,12 @@ class VoiceDesktopQt(QMainWindow):
         self.generating = False
         self.model_ready = model_ready
         self._settings: dict = {}
+        self._workers: set[_Worker] = set()
+        self._closing = False
         self._last_pcm: bytes | None = None
         self._stop_requested = False
+        self._presets: dict[str, dict] = {}
+        self._output_devices: list[dict] = []
         self.setWindowTitle(f"IndexTTS Voice App v{__version__}")
         self.setMinimumSize(980, 760)
         self.resize(1160, 860)
@@ -107,7 +123,7 @@ class VoiceDesktopQt(QMainWindow):
                 font-size: 14px;
                 font-weight: 700;
             }
-            QLabel#cardHint { color: #77839a; font-size: 11px; }
+            QLabel#cardHint { color: #5d6c84; font-size: 11px; }
             QLabel#fieldLabel { color: #53617a; font-size: 11px; font-weight: 600; }
             QLabel#routeText {
                 color: #4b5d7e;
@@ -192,7 +208,9 @@ class VoiceDesktopQt(QMainWindow):
                 padding: 10px 20px;
             }
             QPushButton#primary:hover { background: #425dca; }
+            QPushButton#primary:disabled { color: #65718a; background: #d8dff1; }
             QPushButton#danger { color: #a3424c; }
+            QPushButton#danger:disabled { color: #8793a8; background: #f1f3f7; }
             QToolTip {
                 color: #ffffff;
                 background: #26334f;
@@ -231,6 +249,10 @@ class VoiceDesktopQt(QMainWindow):
         title_box.addWidget(subtitle)
         header_layout.addLayout(title_box)
         header_layout.addStretch(1)
+        self.third_party_button = QPushButton("第三方许可")
+        self.third_party_button.setObjectName("thirdPartyLicenses")
+        self.third_party_button.clicked.connect(lambda: show_third_party(self))
+        header_layout.addWidget(self.third_party_button)
         self.status_pill = QLabel("正在连接本地服务…")
         self.status_pill.setObjectName("statusPill")
         self.status_pill.setMaximumWidth(330)
@@ -259,9 +281,10 @@ class VoiceDesktopQt(QMainWindow):
         content.addLayout(left, 3)
 
         text_card, text_layout = self._card(
-            "角色台词", "输入文字，生成的声音会立即进入虚拟麦克风。"
+            "角色台词", "先导入或选择角色，再输入文字；生成需要等待，并非实时变声。"
         )
         self.text = QTextEdit()
+        self.text.textChanged.connect(self._update_generation_availability)
         self.text.setPlaceholderText("例如：大家好，今天也要一起加油哦！")
         self.text.setMinimumHeight(210)
         self.text.setFont(QFont("Microsoft YaHei UI", 11))
@@ -302,6 +325,7 @@ class VoiceDesktopQt(QMainWindow):
         character_grid.setColumnStretch(3, 1)
         character_grid.addWidget(self._label("角色预设"), 0, 0)
         self.preset = QComboBox()
+        self.preset.currentIndexChanged.connect(self._preset_changed)
         self.preset.setPlaceholderText("选择一个角色")
         character_grid.addWidget(self.preset, 0, 1)
         character_grid.addWidget(self._label("语言"), 0, 2)
@@ -312,20 +336,43 @@ class VoiceDesktopQt(QMainWindow):
         character_grid.addWidget(self._label("参考音频"), 1, 0)
         self.reference = QComboBox()
         self.reference.setEditable(True)
+        self.reference.currentTextChanged.connect(self._update_generation_availability)
         self.reference.setPlaceholderText("可选：使用自定义参考音频")
+        self.reference.lineEdit().setPlaceholderText("临时参考音频（不保存为角色）")
+        self.reference.lineEdit().textEdited.connect(self._temporary_reference_edited)
         character_grid.addWidget(self.reference, 1, 1, 1, 2)
-        browse = QPushButton("浏览文件")
+        browse = QPushButton("临时使用…")
         browse.clicked.connect(self._browse_audio)
         character_grid.addWidget(browse, 1, 3)
         character_layout.addLayout(character_grid)
-        left.addWidget(character_card)
+        role_actions = QHBoxLayout()
+        self.import_preset_button = QPushButton("＋ 导入角色音频")
+        self.import_preset_button.setObjectName("primary")
+        self.import_preset_button.clicked.connect(lambda: self._edit_preset(False))
+        role_actions.addWidget(self.import_preset_button)
+        self.manage_preset_button = QPushButton("管理当前角色…")
+        self.manage_preset_button.setEnabled(False)
+        self.manage_preset_button.clicked.connect(lambda: self._edit_preset(True))
+        role_actions.addWidget(self.manage_preset_button)
+        role_actions.addStretch(1)
+        character_layout.addLayout(role_actions)
+        self.preset_hint = QLabel("还没有角色？点击“导入角色音频”，选择自己的参考人声并命名保存。")
+        self.preset_hint.setObjectName("fieldLabel")
+        self.preset_hint.setWordWrap(True)
+        character_layout.addWidget(self.preset_hint)
+        character_note = QLabel("软件不附带人物素材。保存的角色与临时参考音频二选一，切换角色会清除临时覆盖。")
+        character_note.setObjectName("cardHint")
+        character_note.setWordWrap(True)
+        character_layout.addWidget(character_note)
+        # Make the missing first-use action visible before the large text box.
+        left.insertWidget(0, character_card)
 
         right = QVBoxLayout()
         right.setSpacing(15)
         content.addLayout(right, 2)
 
         route_card, route_layout = self._card(
-            "音频路由", "把两路声音合成一条，TeamSpeak 只需要选择 CABLE Output。"
+            "音频路由", "接收软件的麦克风需选 CABLE Output；TS3 已有本机验证，QQ 兼容性仍待确认。"
         )
         route_layout.addWidget(self._label("真人麦克风"))
         self.microphone_device = QComboBox()
@@ -364,7 +411,7 @@ class VoiceDesktopQt(QMainWindow):
         mix_grid.addWidget(self.tts_gain_label, 1, 2)
         route_layout.addLayout(mix_grid)
         route_layout.addSpacing(4)
-        self.monitor_enabled = QCheckBox("同时监听到耳机")
+        self.monitor_enabled = QCheckBox("本地播放（耳机／扬声器）")
         route_layout.addWidget(self.monitor_enabled)
         self.monitor_device = QComboBox()
         self.monitor_device.setPlaceholderText("选择耳机或扬声器")
@@ -373,6 +420,9 @@ class VoiceDesktopQt(QMainWindow):
         self.apply_mixer_button.setObjectName("primary")
         self.apply_mixer_button.clicked.connect(self.apply_mixer)
         route_layout.addWidget(self.apply_mixer_button)
+        self.output_device.currentIndexChanged.connect(self._output_selection_changed)
+        self.microphone_enabled.toggled.connect(self._update_route_hint)
+        self._update_route_hint()
         route_layout.addStretch(1)
         right.addWidget(route_card, 1)
 
@@ -422,6 +472,13 @@ class VoiceDesktopQt(QMainWindow):
         self.generate_button.clicked.connect(self.generate)
         footer.addWidget(self.generate_button)
         outer.addLayout(footer)
+        for combo in self.findChildren(QComboBox):
+            style_combo_popup(combo)
+            combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+            combo.setMinimumContentsLength(7)
+            combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            combo.currentTextChanged.connect(combo.setToolTip)
+        self._update_generation_availability()
 
     @staticmethod
     def _label(text: str) -> QLabel:
@@ -460,14 +517,29 @@ class VoiceDesktopQt(QMainWindow):
 
     def _run_async(self, callback, on_done=None, on_error=None):
         worker = _Worker(callback)
-        if on_done:
-            worker.signals.result.connect(on_done)
+        # Keep signal objects alive until the GUI consumes the queued result.
+        self._workers.add(worker)
         if on_error is None:
 
             def on_error(message):
                 self._set_status(f"操作失败：{message}", "error")
 
-        worker.signals.error.connect(on_error)
+        def done(result):
+            try:
+                if not self._closing and on_done:
+                    on_done(result)
+            finally:
+                self._workers.discard(worker)
+
+        def failed(message):
+            try:
+                if not self._closing:
+                    on_error(message)
+            finally:
+                self._workers.discard(worker)
+
+        worker.signals.result.connect(done, Qt.ConnectionType.QueuedConnection)
+        worker.signals.error.connect(failed, Qt.ConnectionType.QueuedConnection)
         self.pool.start(worker)
 
     def _refresh_data(self):
@@ -491,69 +563,38 @@ class VoiceDesktopQt(QMainWindow):
         if self.output_limit.findData(limit) < 0:
             self.output_limit.addItem(f"{limit} MB", limit)
         self._select_combo(self.output_limit, limit)
-        self.preset.clear()
-        self.preset.addItem("（不使用预设）", "")
-        for item in data["presets"]:
-            self.preset.addItem(item["name"], item["name"])
-        self._select_combo(self.preset, settings.get("last_preset", ""))
+        self._set_presets(data["presets"], settings.get("last_preset", ""))
+        self._output_devices = data["outputs"]
 
         self.output_device.clear()
         self.output_device.addItem("仅本地试听（不输出到虚拟麦克风）", None)
-        for device in data["outputs"]:
+        cable_outputs = [device for device in data["outputs"] if device.get("is_vb_cable")]
+        for device in cable_outputs:
             marker = (
                 "  · VB-CABLE 推荐"
-                if (device.get("is_vb_cable") and device.get("host_api") == "MME")
-                else ("  · VB-CABLE" if device.get("is_vb_cable") else "")
+                if device.get("host_api") == "MME"
+                else ""
             )
             self.output_device.addItem(
                 f"{device['name']}  [{device['host_api']}]{marker}", device["id"]
             )
-        self._select_output(data["outputs"], settings.get("output_device"))
-        has_cable = any(device.get("is_vb_cable") for device in data["outputs"])
-        if not has_cable:
-            self.route_text.setText(
-                "未检测到 VB-CABLE，当前可使用耳机/扬声器本地试听。"
-                "虚拟麦克风可在安装向导中安装官方驱动；安装后可能需要重启。"
-            )
-        else:
-            self.route_text.setText("真人麦克风   +   角色语音   →   CABLE Output")
+        self._select_combo(self.output_device, settings.get("output_device"))
+        has_cable = bool(cable_outputs)
 
-        self.monitor_device.clear()
-        for device in data["outputs"]:
-            self.monitor_device.addItem(
-                f"{device['name']}  [{device['host_api']}]",
-                device["id"],
-            )
-        self._select_combo(self.monitor_device, settings.get("monitor_device"))
-
-        self.microphone_device.clear()
-        inputs = [item for item in data["inputs"] if not item.get("is_vb_cable")]
-        for device in inputs:
-            self.microphone_device.addItem(
-                f"{device['name']}  [{device['host_api']}]", device["id"]
-            )
-        self._select_input(inputs, settings.get("microphone_device"))
+        fill_local_devices(self.monitor_device, data["outputs"], settings.get("monitor_device"))
+        fill_local_devices(self.microphone_device, data["inputs"], settings.get("microphone_device"))
 
         self.reference.setEditText(settings.get("last_reference_audio", ""))
+        if self.reference.currentText().strip():
+            self.preset.setCurrentIndex(0)
+            self._update_preset_hint()
         self.language.setCurrentText(settings.get("language", "ZH"))
-        self.monitor_enabled.setChecked(bool(settings.get("monitor_enabled", False)))
+        self.monitor_enabled.setChecked(bool(settings.get("monitor_enabled", True)))
         self.microphone_enabled.setChecked(
             bool(settings.get("microphone_enabled", False))
         )
         self.microphone_enabled.setEnabled(has_cable)
-        if not has_cable:
-            self.microphone_enabled.setChecked(False)
-            self.monitor_enabled.setChecked(True)
-            local_outputs = [d for d in data["outputs"] if not d.get("is_vb_cable")]
-            configured = settings.get("monitor_device")
-            chosen = next((d for d in local_outputs if d["id"] == configured), None)
-            chosen = (
-                chosen
-                or next((d for d in local_outputs if d.get("is_default")), None)
-                or (local_outputs[0] if local_outputs else None)
-            )
-            if chosen:
-                self._select_combo(self.monitor_device, chosen["id"])
+        self._output_selection_changed()
         self.microphone_gain.setValue(
             round(float(settings.get("microphone_gain", 1)) * 100)
         )
@@ -566,7 +607,7 @@ class VoiceDesktopQt(QMainWindow):
         )
         self.duration_factor.setText(str(settings.get("duration_factor", 1.0)))
         self._set_status(
-            "模型已就绪，可以生成" if self.model_ready else "界面已连接，正在加载模型…"
+            "模型已就绪，请先选择角色并输入台词" if self.model_ready else "界面已连接，正在加载模型…"
         )
         if self.microphone_enabled.isChecked():
             try:
@@ -592,9 +633,9 @@ class VoiceDesktopQt(QMainWindow):
 
     def _model_loaded(self, result):
         self.model_ready = bool(result.get("model_loaded"))
-        self.generate_button.setEnabled(self.model_ready and not self.generating)
+        self._update_generation_availability()
         self._set_status(
-            "模型已就绪，可以生成" if self.model_ready else "模型尚未就绪",
+            "模型已就绪，请选择角色并输入台词" if self.model_ready else "模型尚未就绪",
             "success" if self.model_ready else "error",
         )
 
@@ -603,48 +644,20 @@ class VoiceDesktopQt(QMainWindow):
         self.generate_button.setEnabled(False)
         self._set_status(f"模型未就绪：{message}。重新启动可自动修复。", "error")
 
-    def _select_output(self, devices: list[dict], configured):
-        preferred = next(
-            (
-                d
-                for d in devices
-                if d.get("is_vb_cable")
-                and d.get("host_api") == "MME"
-                and int(d.get("default_samplerate", 0)) == 44100
-            ),
-            None,
-        )
-        chosen = next((d for d in devices if d["id"] == configured), None)
-        if not chosen or not chosen.get("is_vb_cable"):
-            chosen = preferred or next(
-                (d for d in devices if d.get("is_vb_cable")), None
-            )
-        if chosen:
-            self._select_combo(self.output_device, chosen["id"])
+    def _output_selection_changed(self):
+        if self.output_device.currentData() is None:
+            self.microphone_enabled.setChecked(False)
+            self.monitor_enabled.setChecked(True)
+        self._update_route_hint()
 
-    def _select_input(self, devices: list[dict], configured):
-        chosen = next((d for d in devices if d["id"] == configured), None)
-        preferred = [
-            d
-            for d in devices
-            if d.get("host_api") == "MME"
-            and not any(
-                word in d.get("name", "").casefold()
-                for word in ("virtual", "ivcam", "todesk", "netease", "网易")
-            )
-        ]
-        if chosen is None:
-            chosen = next(
-                (
-                    d
-                    for d in preferred
-                    if "麦克风" in d.get("name", "")
-                    or "microphone" in d.get("name", "").casefold()
-                ),
-                None,
-            ) or (preferred[0] if preferred else (devices[0] if devices else None))
-        if chosen:
-            self._select_combo(self.microphone_device, chosen["id"])
+    def _update_route_hint(self):
+        if self.output_device.currentData() is None:
+            message = "角色语音 → 本地耳机或扬声器，不送入虚拟麦克风。"
+        elif self.microphone_enabled.isChecked():
+            message = "真人麦克风 + 角色语音 → CABLE Output"
+        else:
+            message = "角色语音 → CABLE Output（虚拟麦克风）"
+        self.route_text.setText(message)
 
     @staticmethod
     def _select_combo(combo: QComboBox, value):
@@ -660,14 +673,18 @@ class VoiceDesktopQt(QMainWindow):
             raise ValueError("请先输入角色台词。")
         preset = self.preset.currentData() or None
         reference = self.reference.currentText().strip() or None
+        if preset:
+            reference = None
+            if not self._presets.get(preset, {}).get("reference_exists", True):
+                raise ValueError("该角色的参考音频缺失，请点击“管理当前角色”替换音频。")
         if not preset and not reference:
-            raise ValueError("请选择角色预设或参考音频。")
+            raise ValueError("还没有选择声音：请点击“导入角色音频”创建角色，或临时选择参考音频。")
         output_device = self.output_device.currentData()
         if output_device is None and not self.monitor_enabled.isChecked():
-            raise ValueError("本地试听需要勾选耳机监听；或选择 VB-CABLE 输出。")
+            raise ValueError("请开启本地播放，或选择 VB-CABLE 输出。")
         if (
             self.monitor_enabled.isChecked()
-            and self.monitor_device.currentData() is None
+            and self.monitor_device.currentIndex() < 0
         ):
             raise ValueError("没有可用的耳机或扬声器，请连接后刷新设备。")
         return {
@@ -693,7 +710,7 @@ class VoiceDesktopQt(QMainWindow):
         if output_device is None and self.microphone_enabled.isChecked():
             raise ValueError("请选择 VB-CABLE 输出设备。")
         input_device = self.microphone_device.currentData()
-        if self.microphone_enabled.isChecked() and input_device is None:
+        if self.microphone_enabled.isChecked() and self.microphone_device.currentIndex() < 0:
             raise ValueError("请选择真实麦克风。")
         return {
             "enabled": self.microphone_enabled.isChecked(),
@@ -774,18 +791,18 @@ class VoiceDesktopQt(QMainWindow):
             return
         self.apply_mixer_button.setEnabled(False)
         self._set_status("正在应用混音设置…")
+        settings = dict(self._settings)
+        settings.update(
+            output_device=mixer["output_device"],
+            microphone_enabled=mixer["enabled"],
+            microphone_device=mixer["input_device"],
+            microphone_gain=mixer["mic_gain"],
+            tts_gain=mixer["tts_gain"],
+            monitor_enabled=self.monitor_enabled.isChecked(),
+            monitor_device=self.monitor_device.currentData(),
+        )
 
         def task():
-            settings = dict(self._settings)
-            settings.update(
-                {
-                    "output_device": mixer["output_device"],
-                    "microphone_enabled": mixer["enabled"],
-                    "microphone_device": mixer["input_device"],
-                    "microphone_gain": mixer["mic_gain"],
-                    "tts_gain": mixer["tts_gain"],
-                }
-            )
             self._put("/v1/settings", settings)
             self._configure_mixer(mixer)
 
@@ -823,6 +840,8 @@ class VoiceDesktopQt(QMainWindow):
             self._set_status(str(exc), "error")
             return
         self.generating = True
+        self.import_preset_button.setEnabled(False)
+        self.manage_preset_button.setEnabled(False)
         self.save_output.setEnabled(False)
         self.output_limit.setEnabled(False)
         self.save_storage_button.setEnabled(False)
@@ -831,7 +850,11 @@ class VoiceDesktopQt(QMainWindow):
         self.save_last_button.setEnabled(False)
         self.generate_button.setEnabled(False)
         self.stop_button.setEnabled(True)
-        self._set_status("正在生成，音频会实时进入虚拟麦克风…")
+        self._set_status(
+            "正在生成，将播放到耳机或扬声器…"
+            if payload["output_device"] is None
+            else "正在生成，将输出到 VB-CABLE…"
+        )
 
         def task():
             self._put("/v1/settings", self._settings_payload(payload, mixer))
@@ -854,11 +877,13 @@ class VoiceDesktopQt(QMainWindow):
                             audio.clear()
                             too_large = True
             saved = None
-            if payload["save_output"]:
+            if job_id:
                 try:
                     saved = self._get(f"/v1/outputs/{job_id}")
-                except Exception as exc:
-                    saved = {"saved": False, "error": f"无法确认自动保存结果：{exc}"}
+                except Exception as exc:  # noqa: BLE001 - result lookup must not discard generated audio
+                    saved = {"saved": False, "playback_unknown": str(exc)}
+                    if payload["save_output"]:
+                        saved["error"] = "未能确认自动保存结果。"
             return {"pcm": bytes(audio) if audio else None, "too_large": too_large,
                     "saved": saved}
 
@@ -866,32 +891,47 @@ class VoiceDesktopQt(QMainWindow):
 
     def _generation_done(self, result):
         self.generating = False
+        self.import_preset_button.setEnabled(True)
+        self._update_preset_hint()
         self.save_output.setEnabled(True)
         self.output_limit.setEnabled(self.save_output.isChecked())
         self.save_storage_button.setEnabled(True)
         self._last_pcm = result["pcm"]
         self.save_last_button.setEnabled(self._last_pcm is not None)
-        self.generate_button.setEnabled(self.model_ready)
+        self._update_generation_availability()
         self.stop_button.setEnabled(False)
         prefix = "已停止" if self._stop_requested else "生成完成"
-        saved = result.get("saved")
-        if saved and saved.get("saved"):
+        saved = result.get("saved") or {}
+        state = "success"
+        storage_label = "未自动保存"
+        if saved.get("saved"):
+            storage_label = "已自动保存"
             detail = f"自动保存位置：{saved['path']}。超过保留上限时会清理最早的自动保存音频。"
-            self._set_status(f"{prefix} · 已自动保存", "success", detail)
-        elif saved and saved.get("error"):
-            self._set_status(f"{prefix} · 未自动保存", "", saved["error"] + "；可尝试另存上一条。")
+        elif saved.get("error"):
+            state = ""
+            detail = saved["error"] + "；可尝试另存上一条。"
         else:
             detail = "本条没有写入硬盘；需要保留时点击“另存上一条”。"
             if result.get("too_large"):
                 detail = "本条超过 64 MB 临时内存上限，未暂存；长音频需要提前开启自动保存。"
-            self._set_status(f"{prefix} · 未自动保存", "success", detail)
+        if saved.get("playback_error"):
+            self._set_status(
+                f"{prefix} · 播放异常", "error",
+                f"{saved['playback_error']} {detail}",
+            )
+        elif saved.get("playback_unknown"):
+            self._set_status(f"{prefix} · 播放状态未确认", "", detail)
+        else:
+            self._set_status(f"{prefix} · {storage_label}", state, detail)
 
     def _generation_error(self, message: str):
         self.generating = False
+        self.import_preset_button.setEnabled(True)
+        self._update_preset_hint()
         self.save_output.setEnabled(True)
         self.output_limit.setEnabled(self.save_output.isChecked())
         self.save_storage_button.setEnabled(True)
-        self.generate_button.setEnabled(self.model_ready)
+        self._update_generation_availability()
         self.stop_button.setEnabled(False)
         self._set_status(f"生成失败：{message}", "error")
 
@@ -926,7 +966,95 @@ class VoiceDesktopQt(QMainWindow):
             "音频文件 (*.wav *.mp3 *.ogg *.flac *.m4a);;所有文件 (*.*)",
         )
         if path:
+            self.preset.setCurrentIndex(0)
             self.reference.setEditText(path)
+            self._update_preset_hint()
+
+    def _set_presets(self, items, selected=""):
+        self._presets = {item["name"]: item for item in items}
+        blocker = QSignalBlocker(self.preset)
+        self.preset.clear()
+        self.preset.addItem("（临时音频 / 尚未选择角色）", "")
+        for item in items:
+            label = item["name"] + (" · 音频缺失" if not item.get("reference_exists", True) else "")
+            self.preset.addItem(label, item["name"])
+        self._select_combo(self.preset, selected)
+        del blocker
+        self._preset_changed()
+
+    def _preset_changed(self, *_args):
+        selected = self.preset.currentData()
+        if selected and hasattr(self, "reference"):
+            self.reference.setEditText("")
+            item = self._presets.get(selected, {})
+            if item.get("language"):
+                self.language.setCurrentText(item["language"])
+        self._update_preset_hint()
+
+    def _temporary_reference_edited(self, text):
+        if text.strip():
+            self.preset.setCurrentIndex(0)
+        self._update_preset_hint()
+
+    def _update_preset_hint(self):
+        if not hasattr(self, "preset_hint"):
+            return
+        selected = self.preset.currentData()
+        self.manage_preset_button.setEnabled(bool(selected) and not self.generating)
+        if selected:
+            item = self._presets.get(selected, {})
+            if not item.get("reference_exists", True):
+                text = f"“{selected}”的参考音频已缺失，请点击“管理当前角色”替换。"
+            else:
+                seconds = item.get("duration_seconds")
+                duration = f" · {seconds:.1f} 秒" if isinstance(seconds, (int, float)) else ""
+                text = f"正在使用保存的角色：{selected}{duration}。可管理、试听或替换参考音频。"
+        elif self.reference.currentText().strip():
+            text = "正在临时使用参考音频；如需以后反复选择，请通过“导入角色音频”保存角色。"
+        else:
+            text = "首次使用：① 导入角色音频并保存  ② 输入台词  ③ 生成并输出。"
+        self.preset_hint.setText(text)
+        self._update_generation_availability()
+
+    def _update_generation_availability(self, *_args):
+        if not hasattr(self, "generate_button"):
+            return
+        name = self.preset.currentData()
+        valid_role = bool(name) and self._presets.get(name, {}).get("reference_exists", True)
+        has_source = valid_role or (not name and bool(self.reference.currentText().strip()))
+        has_text = bool(self.text.toPlainText().strip())
+        self.generate_button.setEnabled(self.model_ready and not self.generating and bool(has_source) and has_text)
+        self.generate_button.setToolTip("先导入/选择可用角色，并输入台词；模型就绪后即可生成。")
+
+    def _edit_preset(self, editing):
+        if self.generating:
+            self._set_status("请先完成或停止生成，再管理角色。", "error")
+            return
+        item = self._presets.get(self.preset.currentData()) if editing else None
+        if editing and item is None:
+            self._set_status("请先选择要管理的角色。", "error")
+            return
+        dialog = PresetDialog(self.base_url, item, self._output_devices,
+                              self.monitor_device.currentData(), self)
+        if not editing and self.reference.currentText().strip():
+            dialog.source_path = Path(self.reference.currentText().strip())
+            dialog.file.setText(str(dialog.source_path))
+            dialog.name.setText(dialog.source_path.stem[:60])
+        if dialog.exec() != dialog.DialogCode.Accepted:
+            return
+        selected = dialog.result_name or ""
+        def task():
+            items = self._get("/v1/presets")
+            settings = self._get("/v1/settings")
+            settings.update(last_preset=selected, last_reference_audio="")
+            self._put("/v1/settings", settings)
+            return items
+        def done(items):
+            self.reference.setEditText("")
+            self._set_presets(items, selected)
+            self._settings.update(last_preset=selected, last_reference_audio="")
+            self._set_status("角色已保存并选中，可输入台词生成。" if selected else "角色已移入回收区。", "success")
+        self._run_async(task, done)
 
     def _set_status(self, text: str, state: str = "", detail: str | None = None):
         self.status_pill.setText(text if len(text) <= 70 else text[:69] + "…")
@@ -939,6 +1067,7 @@ class VoiceDesktopQt(QMainWindow):
         self.status_pill.style().polish(self.status_pill)
 
     def closeEvent(self, event):
+        self._closing = True
         if self.generating:
             try:
                 requests.post(self.base_url + "/v1/stop", timeout=2)

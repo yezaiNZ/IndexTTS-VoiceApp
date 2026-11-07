@@ -12,5 +12,5 @@ def prevent_unmocked_network(monkeypatch):
     def blocked(*args, **kwargs):
         raise AssertionError("Tests must mock network requests")
 
-    for name in ("get", "post", "put"):
+    for name in ("get", "post", "put", "request", "delete"):
         monkeypatch.setattr(requests, name, blocked)

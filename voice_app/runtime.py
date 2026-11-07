@@ -1,23 +1,25 @@
 from __future__ import annotations
 
+import logging
 import os
 import sys
 import threading
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator
 
-from .audio import AudioRouter, MicrophoneMixer, SAMPLE_RATE
-from .presets import PresetResolver, PresetStore, ResolvedSynthesis
+from .audio import SAMPLE_RATE, AudioRouter, MicrophoneMixer, PlaybackError
 from .output_store import GeneratedAudioStore
+from .presets import PresetResolver, PresetStore, ResolvedSynthesis
 from .schemas import SynthesisRequest
-
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATA_ROOT = Path(os.environ.get("VOICE_APP_DATA_DIR", PROJECT_ROOT))
 OUTPUT_DIR = DATA_ROOT / "outputs"
 DEFAULT_INDEXTTS_ROOT = Path(os.environ.get("INDEXTTS_ROOT", ""))
+_LOG = logging.getLogger(__name__)
 
 
 class RuntimeBusyError(RuntimeError):
@@ -138,16 +140,14 @@ class ModelRuntime:
                 with self._state_lock:
                     self._loading = False
 
-    def start_session(self, request: SynthesisRequest) -> "SynthesisSession":
-        resolved = self.resolver.resolve(request)
-        if resolved.emotion_mode == 3 and not self.options.use_qwen_emo:
-            raise ValueError(
-                "emotion text mode requires starting the service with --qwen-emo"
-            )
-        model = self.ensure_loaded()
+    def start_session(self, request: SynthesisRequest) -> SynthesisSession:
         if not self._generation_lock.acquire(blocking=False):
             raise RuntimeBusyError("another synthesis job is already running")
         try:
+            resolved = self.resolver.resolve(request)
+            if resolved.emotion_mode == 3 and not self.options.use_qwen_emo:
+                raise ValueError("emotion text mode requires starting the service with --qwen-emo")
+            model = self.ensure_loaded()
             session = SynthesisSession(self, model, resolved)
             with self._state_lock:
                 self._active = session
@@ -155,6 +155,15 @@ class ModelRuntime:
         except Exception:
             self._generation_lock.release()
             raise
+
+    @contextmanager
+    def edit_presets(self):
+        if not self._generation_lock.acquire(blocking=False):
+            raise RuntimeBusyError("正在生成语音，请完成或停止生成后再修改角色。")
+        try:
+            yield
+        finally:
+            self._generation_lock.release()
 
     def stop(self) -> tuple[bool, str | None]:
         with self._state_lock:
@@ -164,7 +173,7 @@ class ModelRuntime:
         session.request_stop()
         return True, session.job_id
 
-    def _finish(self, session: "SynthesisSession"):
+    def _finish(self, session: SynthesisSession):
         with self._state_lock:
             if self._active is session:
                 self._active = None
@@ -186,6 +195,12 @@ class SynthesisSession:
             resolved.monitor_device,
         )
         self._closed = False
+        self._mixer_failed = False
+        self._playback_errors: list[str] = []
+
+    def _report_playback_error(self, message: str):
+        self._playback_errors.append(message)
+        _LOG.warning("Audio output failed for job %s: %s", self.job_id, message)
 
     def request_stop(self):
         self.stop_event.set()
@@ -249,9 +264,13 @@ class SynthesisSession:
                 )
                 if recording is not None:
                     recording.write(pcm)
-                if self.using_mixer:
-                    self.runtime.mixer.inject(pcm)
                 self.router.push(pcm)
+                if self.using_mixer and not self._mixer_failed:
+                    try:
+                        self.runtime.mixer.inject(pcm)
+                    except RuntimeError as exc:
+                        self._mixer_failed = True
+                        self._report_playback_error(f"VB-CABLE 混音输出失败：{exc}")
                 yield pcm
             complete = not stopped and not self.stop_event.is_set()
         finally:
@@ -262,12 +281,14 @@ class SynthesisSession:
                 try:
                     self.close(drain=complete)
                 finally:
+                    playback_error = "；".join(self._playback_errors) or None
                     if recording is not None:
-                        recording.finish(complete)
+                        recording.finish(complete, playback_error=playback_error)
                     else:
                         self.runtime.output_store.remember(self.job_id, {
                             "save_requested": False, "saved": False,
                             "path": None, "error": None, "removed_count": 0,
+                            "playback_error": playback_error,
                         })
 
     def close(self, drain: bool = True):
@@ -275,14 +296,19 @@ class SynthesisSession:
             return
         self._closed = True
         try:
-            if drain and self.using_mixer:
-                if not self.runtime.mixer.wait_for_tts():
-                    raise RuntimeError(
-                        "timed out waiting for mixed TTS audio to finish"
-                    )
-            self.router.close(drain=drain)
+            if (
+                drain and self.using_mixer and not self._mixer_failed
+                and not self.runtime.mixer.wait_for_tts()
+            ):
+                self.runtime.mixer.clear_tts()
+                self._report_playback_error("等待 VB-CABLE 混音输出结束超时。")
         finally:
-            self.runtime._finish(self)
+            try:
+                self.router.close(drain=drain)
+            except PlaybackError as exc:
+                self._report_playback_error(str(exc))
+            finally:
+                self.runtime._finish(self)
 
 
 def _torch_int16():

@@ -381,6 +381,67 @@ def test_desktop_automatic_save_uses_result_not_unconfirmed_header(window):
     assert window.save_last_button.isEnabled()
 
 
+@pytest.mark.parametrize("save_output", [False, True])
+def test_playback_failure_keeps_generated_audio_and_is_reported(
+    app, tmp_path, monkeypatch, save_output
+):
+    from voice_app import runtime
+    from voice_app.audio import PlaybackError
+
+    router = runtime.AudioRouter
+
+    class BrokenHeadphones(router):
+        def close(self, drain=True):
+            if drain:
+                raise PlaybackError("耳机播放等待超时")
+
+    monkeypatch.setattr(runtime, "AudioRouter", BrokenHeadphones)
+    with TestClient(app) as client:
+        reply = client.post("/v1/tts/stream", json=body(tmp_path, save_output=save_output))
+        assert reply.status_code == 200 and len(reply.content) == 1200
+        result = client.get("/v1/outputs/" + reply.headers["x-job-id"]).json()
+        assert result["playback_error"] == "耳机播放等待超时"
+        assert result["saved"] is save_output
+        assert not client.get("/health").json()["busy"]
+        if save_output:
+            with wave.open(result["path"], "rb") as reader:
+                assert reader.readframes(reader.getnframes()) == reply.content
+
+
+def test_desktop_reports_playback_failure_even_without_auto_save(window, monkeypatch):
+    from voice_app import desktop_qt
+
+    pcm = b"\xe8\x03" * 20
+
+    class Reply:
+        headers: ClassVar[dict] = {"X-Job-Id": "test-job"}
+        ok = True
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def iter_content(self, **kwargs):
+            yield pcm
+
+    def result(path):
+        assert path == "/v1/outputs/test-job"
+        return {"saved": False, "playback_error": "Arctis Nova 3：等待设备播完超时。"}
+
+    monkeypatch.setattr(desktop_qt.requests, "post", lambda *a, **k: Reply())
+    monkeypatch.setattr(window, "_put", lambda *args: None)
+    monkeypatch.setattr(window, "_configure_mixer", lambda *args: None)
+    monkeypatch.setattr(window, "_get", result)
+    monkeypatch.setattr(window, "_run_async", lambda task, done, error: done(task()))
+    assert not window.save_output.isChecked()
+    window.generate()
+    assert "生成完成 · 播放异常" in window.status_pill.text()
+    assert "Arctis Nova 3" in window.status_detail.text()
+    assert window.save_last_button.isEnabled() and window._last_pcm == pcm
+
+
 def test_desktop_manual_export_does_not_change_auto_save(window, tmp_path, monkeypatch):
     from voice_app.desktop_qt import QFileDialog
 

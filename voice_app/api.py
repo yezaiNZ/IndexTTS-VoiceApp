@@ -1,19 +1,28 @@
 from __future__ import annotations
 
-from contextlib import asynccontextmanager
 import io
-from pathlib import Path
 import wave
+from contextlib import asynccontextmanager
+from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
 
 from . import __version__
 from .audio import SAMPLE_RATE, list_input_devices, list_output_devices
+from .output_store import LAST_AUDIO_LIMIT, MIB, GeneratedAudioStore
 from .presets import preset_summaries
-from .output_store import GeneratedAudioStore, LAST_AUDIO_LIMIT, MIB
+from .reference_audio import ReferencePreview, prepare_reference
+from .reference_limits import MAX_UPLOAD_BYTES
 from .runtime import ModelRuntime, RuntimeBusyError, RuntimeOptions
-from .schemas import DesktopSettings, MixerStartRequest, StopResponse, SynthesisRequest
+from .schemas import (
+    DesktopSettings,
+    Language,
+    MixerStartRequest,
+    PresetTrashRequest,
+    StopResponse,
+    SynthesisRequest,
+)
 from .settings import DEFAULT_SETTINGS_PATH, SettingsStore
 
 
@@ -27,10 +36,12 @@ def create_app(
         lambda: settings.load().output_limit_mb * MIB,
     )
     runtime = ModelRuntime(runtime_options, output_store=output_store)
+    preview = ReferencePreview()
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         yield
+        preview.stop()
         runtime.mixer.stop()
 
     app = FastAPI(
@@ -41,6 +52,34 @@ def create_app(
     )
     app.state.runtime = runtime
     app.state.settings = settings
+    app.state.preview = preview
+
+    def check_preset_origin(request: Request):
+        origin = request.headers.get("origin")
+        if origin and origin.rstrip("/") != str(request.base_url).rstrip("/"):
+            raise HTTPException(status_code=403, detail="不允许其他网站操作本机角色预设。")
+
+    async def read_audio_body(request: Request) -> bytes:
+        check_preset_origin(request)
+        if request.headers.get("content-type", "").split(";", 1)[0] != "application/octet-stream":
+            raise HTTPException(status_code=415, detail="请通过桌面导入入口发送音频文件。")
+        result = bytearray()
+        async for block in request.stream():
+            if len(result) + len(block) > MAX_UPLOAD_BYTES:
+                raise HTTPException(status_code=413, detail="音频不能超过 25 MB，请缩小文件或截取所需片段。")
+            result.extend(block)
+        return bytes(result)
+
+    def preset_failure(exc):
+        code = 409 if isinstance(exc, (FileExistsError, RuntimeBusyError)) else 404 if isinstance(exc, FileNotFoundError) else 422
+        raise HTTPException(status_code=code, detail=str(exc)) from exc
+
+    def selection_changed(old_name: str, new_name: str):
+        value = settings.load()
+        if value.last_preset == old_name:
+            value.last_preset = new_name
+            value.last_reference_audio = ""
+            settings.save(value)
 
     @app.get("/health")
     def health():
@@ -57,6 +96,81 @@ def create_app(
     @app.get("/v1/presets")
     def presets():
         return preset_summaries(runtime.resolver.store)
+
+    @app.post("/v1/presets", status_code=201)
+    async def import_preset(request: Request, name: str, filename: str, language: Language = "ZH"):
+        body = await read_audio_body(request)
+        # Decoding/file writes run in a thread, not the ASGI event loop.
+        from starlette.concurrency import run_in_threadpool
+
+        def task():
+            try:
+                reference = prepare_reference(body, filename)
+                with runtime.edit_presets():
+                    return runtime.resolver.store.create(name, reference, language)
+            except (OSError, ValueError, RuntimeBusyError) as exc:
+                preset_failure(exc)
+        return await run_in_threadpool(task)
+
+    @app.put("/v1/presets/{name}")
+    async def update_preset(request: Request, name: str, new_name: str, filename: str = "", language: Language = "ZH"):
+        body = await read_audio_body(request)
+        from starlette.concurrency import run_in_threadpool
+
+        def task():
+            try:
+                reference = prepare_reference(body, filename) if body else None
+                with runtime.edit_presets():
+                    result = runtime.resolver.store.update(name, new_name, reference, language)
+                    selection_changed(name, result["name"])
+                    return result
+            except (OSError, ValueError, RuntimeBusyError) as exc:
+                preset_failure(exc)
+        return await run_in_threadpool(task)
+
+    @app.post("/v1/presets/{name}/trash")
+    def trash_preset(name: str, request: Request, confirmation: PresetTrashRequest):
+        check_preset_origin(request)
+        try:
+            with runtime.edit_presets():
+                destination = runtime.resolver.store.trash(name)
+                selection_changed(name, "")
+            return {"removed": True, "recoverable": True, "trash_path": str(destination)}
+        except (OSError, ValueError, RuntimeBusyError) as exc:
+            preset_failure(exc)
+
+    @app.post("/v1/preset-preview")
+    async def preview_reference(
+        request: Request, device_id: int | None = None, filename: str = "", preset: str = ""
+    ):
+        body = await read_audio_body(request)
+        from starlette.concurrency import run_in_threadpool
+
+        def task():
+            try:
+                if preset and not body:
+                    data = runtime.resolver.store.load(preset)
+                    if data is None:
+                        raise FileNotFoundError("角色不存在，请刷新列表。")
+                    content = runtime.resolver.store.reference_bytes(preset)
+                    name = data.get("prompt_audio", "")
+                else:
+                    content, name = body, filename
+                try:
+                    reference = prepare_reference(content, name)
+                except ValueError as exc:
+                    raise ValueError(f"音频检查未通过，未播放。{exc}") from exc
+                preview.play(reference, device_id)
+                return {"played": True, "duration_seconds": reference.seconds}
+            except (OSError, ValueError, RuntimeError) as exc:
+                preset_failure(exc)
+        return await run_in_threadpool(task)
+
+    @app.post("/v1/preset-preview/stop")
+    def stop_reference_preview(request: Request):
+        check_preset_origin(request)
+        preview.stop()
+        return {"stopped": True}
 
     @app.get("/v1/devices")
     def devices():
@@ -185,7 +299,7 @@ def _ensure_saved_mixer(
 ):
     """Restore the persistent mic bridge before a synthesis request starts."""
     saved = settings.load()
-    if not saved.microphone_enabled or saved.microphone_device is None:
+    if not saved.microphone_enabled:
         return
     output_device = saved.output_device or request.output_device
     if output_device is None:

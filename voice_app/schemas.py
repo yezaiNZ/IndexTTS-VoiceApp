@@ -4,7 +4,6 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-
 Language = Literal["ZH", "EN", "JA", "ES"]
 
 
@@ -67,7 +66,7 @@ class DesktopSettings(BaseModel):
     microphone_device: int | None = None
     microphone_gain: float = Field(default=1.0, ge=0, le=3)
     tts_gain: float = Field(default=1.0, ge=0, le=3)
-    monitor_enabled: bool = False
+    monitor_enabled: bool = True
     monitor_device: int | None = None
     last_preset: str = ""
     last_reference_audio: str = ""
@@ -83,6 +82,13 @@ class PresetSummary(BaseModel):
     name: str
     reference_audio: str
     emotion_mode: int = 0
+    reference_exists: bool = True
+    language: Language = "ZH"
+    duration_seconds: float | None = None
+
+
+class PresetTrashRequest(BaseModel):
+    confirm: Literal[True]
 
 
 class AudioDevice(BaseModel):
@@ -101,7 +107,7 @@ class StopResponse(BaseModel):
 
 
 class MixerStartRequest(BaseModel):
-    input_device: int
+    input_device: int | None
     output_device: int
     mic_gain: float = Field(default=1.0, ge=0, le=3)
     tts_gain: float = Field(default=1.0, ge=0, le=3)

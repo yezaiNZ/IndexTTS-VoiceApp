@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import logging
 import math
 import queue
+import sys
 import threading
 import time
 from collections import deque
@@ -12,45 +14,29 @@ import sounddevice as sd
 from scipy.signal import resample_poly
 
 from .schemas import AudioDevice
-
+from .windows_audio import is_device_mapper, preferred_wave_name
 
 SAMPLE_RATE = 22050
+_PLAYBACK_GRACE_SECONDS = 5.0
+_LOG = logging.getLogger(__name__)
 
 
 def list_output_devices() -> list[AudioDevice]:
-    devices = sd.query_devices()
-    host_apis = sd.query_hostapis()
-    default_output = _default_output_device()
-    result: list[AudioDevice] = []
-    for index, device in enumerate(devices):
-        channels = int(device.get("max_output_channels", 0))
-        if channels < 1:
-            continue
-        host_index = int(device.get("hostapi", 0))
-        host_name = str(host_apis[host_index].get("name", ""))
-        name = str(device.get("name", f"Device {index}"))
-        normalized = name.casefold()
-        result.append(
-            AudioDevice(
-                id=index,
-                name=name,
-                host_api=host_name,
-                channels=channels,
-                default_samplerate=float(device.get("default_samplerate", SAMPLE_RATE)),
-                is_default=index == default_output,
-                is_vb_cable=("cable input" in normalized or "vb-audio" in normalized),
-            )
-        )
-    return result
+    return _list_devices(input_device=False)
 
 
 def list_input_devices() -> list[AudioDevice]:
+    return _list_devices(input_device=True)
+
+
+def _list_devices(*, input_device: bool) -> list[AudioDevice]:
     devices = sd.query_devices()
     host_apis = sd.query_hostapis()
-    default_input = _default_input_device()
+    channel_key = "max_input_channels" if input_device else "max_output_channels"
+    cable_name = "cable output" if input_device else "cable input"
     result: list[AudioDevice] = []
     for index, device in enumerate(devices):
-        channels = int(device.get("max_input_channels", 0))
+        channels = int(device.get(channel_key, 0))
         if channels < 1:
             continue
         host_index = int(device.get("hostapi", 0))
@@ -64,27 +50,47 @@ def list_input_devices() -> list[AudioDevice]:
                 host_api=host_name,
                 channels=channels,
                 default_samplerate=float(device.get("default_samplerate", SAMPLE_RATE)),
-                is_default=index == default_input,
-                is_vb_cable=("cable output" in normalized or "vb-audio" in normalized),
+                is_vb_cable=(cable_name in normalized or "vb-audio" in normalized),
             )
         )
+    default = _default_device_index(result, input_device=input_device)
+    for device in result:
+        device.is_default = device.id == default
     return result
 
 
-def _default_input_device() -> int | None:
+def _default_device_index(devices: list[AudioDevice], *, input_device: bool) -> int | None:
+    if sys.platform == "win32":
+        # PortAudio's MME default often points at the opaque Sound Mapper.
+        # Resolve the real endpoint each time and don't guess when names collide.
+        preferred = preferred_wave_name(input_device=input_device)
+        if not preferred:
+            return None
+        matches = [
+            device.id for device in devices
+            if device.host_api == "MME"
+            and device.name.strip().casefold() == preferred.strip().casefold()
+        ]
+        return matches[0] if len(matches) == 1 else None
     try:
-        value = sd.default.device[0]
+        value = sd.default.device[0 if input_device else 1]
         return int(value) if value is not None and int(value) >= 0 else None
     except (TypeError, ValueError, sd.PortAudioError):
         return None
 
 
-def _default_output_device() -> int | None:
-    try:
-        value = sd.default.device[1]
-        return int(value) if value is not None and int(value) >= 0 else None
-    except (TypeError, ValueError, sd.PortAudioError):
-        return None
+def resolve_system_device(devices: list[AudioDevice], *, input_device: bool) -> int:
+    name = "麦克风" if input_device else "耳机或扬声器"
+    selected = next((device for device in devices if device.is_default), None)
+    if selected is None or is_device_mapper(selected.name):
+        raise ValueError(f"找不到可用的系统默认{name}，请检查 Windows 声音设置或手动选择设备。")
+    if selected.is_vb_cable:
+        raise ValueError(f"系统默认设备是 VB-CABLE，请手动选择用于本地使用的{name}。")
+    return selected.id
+
+
+class PlaybackError(RuntimeError):
+    """Generated audio could not be delivered to an output device."""
 
 
 @dataclass
@@ -96,17 +102,15 @@ class _Sink:
         info = sd.query_devices(self.device_id)
         self.target_rate = int(float(info["default_samplerate"]))
         self.channels = 2 if int(info["max_output_channels"]) >= 2 else 1
+        self.name = str(info.get("name", self.device_id))
         self.items: queue.Queue[bytes | None] = queue.Queue(maxsize=4)
         self.stopping = threading.Event()
+        self.finished = threading.Event()
         self.error: Exception | None = None
-        self.stream = sd.OutputStream(
-            device=self.device_id,
-            samplerate=self.target_rate,
-            channels=self.channels,
-            dtype="int16",
-            latency="high",
-        )
-        self.stream.start()
+        self.stream = None
+        self._stream_lock = threading.Lock()
+        self._state_lock = threading.Lock()
+        self._pending_bytes = 0
         self.worker = threading.Thread(
             target=self._run,
             name=f"audio-device-{self.device_id}",
@@ -115,63 +119,146 @@ class _Sink:
         self.worker.start()
 
     def put(self, pcm: bytes):
+        if not pcm:
+            return
+        with self._state_lock:
+            self._pending_bytes += len(pcm)
+        queued = False
+        try:
+            queued = self._enqueue(pcm, self._drain_deadline())
+        finally:
+            if not queued:
+                self._consume(len(pcm))
+
+    def _consume(self, size: int):
+        with self._state_lock:
+            self._pending_bytes -= size
+
+    def _drain_deadline(self) -> float:
+        with self._state_lock:
+            remaining = self._pending_bytes / (2 * self.source_rate)
+        return time.monotonic() + remaining + _PLAYBACK_GRACE_SECONDS
+
+    def _failure(self, detail: str) -> PlaybackError:
+        return PlaybackError(f"{self.name}（设备 {self.device_id}）：{detail}")
+
+    def _raise_worker_error(self):
         if self.error is not None:
-            raise RuntimeError(
-                f"audio output device {self.device_id} failed: {self.error}"
-            ) from self.error
-        if not self.stopping.is_set():
-            self.items.put(pcm)
+            raise self._failure(f"播放失败：{self.error}") from self.error
+
+    def _enqueue(self, item: bytes | None, deadline: float) -> bool:
+        while not self.stopping.is_set():
+            self._raise_worker_error()
+            if self.finished.is_set():
+                if item is None:
+                    return False
+                raise self._failure("播放设备提前关闭。")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self.abort()
+                raise self._failure("等待播放设备接收音频超时。")
+            try:
+                self.items.put(item, timeout=min(remaining, 0.05))
+                return True
+            except queue.Full:
+                continue
+        return False
 
     def _run(self):
+        stream = None
+        underflows = 0
         try:
             while not self.stopping.is_set():
                 item = self.items.get()
                 if item is None:
                     break
-                samples = convert_pcm(
-                    item,
-                    source_rate=self.source_rate,
-                    target_rate=self.target_rate,
-                    channels=self.channels,
-                )
-                self.stream.write(samples)
-        except Exception as exc:  # surfaced on the next push or at close
-            self.error = exc
+                try:
+                    samples = convert_pcm(
+                        item,
+                        source_rate=self.source_rate,
+                        target_rate=self.target_rate,
+                        channels=self.channels,
+                    )
+                    if self.stopping.is_set():
+                        break
+                    if stream is None:
+                        # Prepare the first samples before opening the device.
+                        # Don't run an empty playback stream during model inference.
+                        stream = sd.OutputStream(
+                            device=self.device_id,
+                            samplerate=self.target_rate,
+                            channels=self.channels,
+                            dtype="int16",
+                            latency="high",
+                        )
+                        with self._stream_lock:
+                            self.stream = stream
+                        if self.stopping.is_set():
+                            break
+                        stream.start()
+                    if not self.stopping.is_set():
+                        underflows += bool(stream.write(samples))
+                finally:
+                    self._consume(len(item))
+            if stream is not None and not self.stopping.is_set():
+                # PortAudio stop drains the device; a failure is not a success.
+                stream.stop()
+        except Exception as exc:  # noqa: BLE001 - relay driver/thread failures to the caller
+            if not self.stopping.is_set():
+                self.error = exc
         finally:
             try:
-                self.stream.stop()
-            except sd.PortAudioError:
-                pass
-            self.stream.close()
+                with self._stream_lock:
+                    self.stream = None
+                if stream is not None:
+                    stream.close()
+            except Exception as exc:  # noqa: BLE001 - a failed device close is also a playback failure
+                if not self.stopping.is_set():
+                    self.error = self.error or exc
+            finally:
+                self.finished.set()
+            if underflows:
+                _LOG.warning(
+                    "Audio output device %d (%s) reported %d buffer underflow(s)",
+                    self.device_id, self.name, underflows,
+                )
 
     def close(self, drain: bool = True):
-        if not drain:
+        deadline = self._drain_deadline() if drain else time.monotonic() + _PLAYBACK_GRACE_SECONDS
+        try:
+            if drain:
+                if not self.finished.is_set():
+                    self._enqueue(None, deadline)
+            else:
+                self.abort()
+            if not self.finished.wait(max(0.0, deadline - time.monotonic())):
+                raise self._failure("等待设备播完超时，音频可能未完整播放。")
+            if drain:
+                self._raise_worker_error()
+        except PlaybackError:
             self.abort()
-        else:
-            self.items.put(None)
-        self.worker.join(timeout=5)
-        if self.error is not None and drain:
-            raise RuntimeError(
-                f"audio output device {self.device_id} failed: {self.error}"
-            ) from self.error
+            raise
 
     def abort(self):
-        if self.stopping.is_set():
-            return
-        self.stopping.set()
-        try:
-            self.stream.abort()
-        except sd.PortAudioError:
-            pass
+        with self._state_lock:
+            if self.stopping.is_set():
+                return
+            self.stopping.set()
         try:
             self.items.put_nowait(None)
         except queue.Full:
-            while True:
+            pass  # The worker checks stopping before it takes another item.
+        if self.stream is not None:
+            # A faulty driver must not block the API's stop/timeout response.
+            threading.Thread(target=self._abort_device, daemon=True).start()
+
+    def _abort_device(self):
+        with self._stream_lock:
+            if self.stream is not None:
                 try:
-                    self.items.get_nowait()
-                except queue.Empty:
-                    break
-            self.items.put_nowait(None)
+                    self.stream.abort()
+                except sd.PortAudioError:
+                    pass
 
 
 def convert_pcm(
@@ -291,13 +378,15 @@ class MicrophoneMixer:
 
     def start(
         self,
-        input_device: int,
+        input_device: int | None,
         output_device: int,
         mic_gain: float = 1.0,
         tts_gain: float = 1.0,
     ) -> dict:
         inputs = list_input_devices()
         outputs = list_output_devices()
+        if input_device is None:
+            input_device = resolve_system_device(inputs, input_device=True)
         selected_input = next(
             (device for device in inputs if device.id == input_device), None
         )
@@ -449,13 +538,17 @@ class AudioRouter:
         ids: list[int] = []
         if output_device is not None:
             ids.append(output_device)
-        if monitor_enabled and monitor_device is not None and monitor_device not in ids:
-            ids.append(monitor_device)
+        if monitor_enabled:
+            if monitor_device is None:
+                monitor_device = resolve_system_device(devices, input_device=False)
+            if monitor_device not in ids:
+                ids.append(monitor_device)
         valid_ids = {device.id for device in devices}
         invalid = [device_id for device_id in ids if device_id not in valid_ids]
         if invalid:
             raise ValueError(f"invalid output device id: {invalid[0]}")
         self.sinks: list[_Sink] = []
+        self._failed_sinks: dict[int, PlaybackError] = {}
         self._closed = False
         try:
             for device_id in ids:
@@ -466,7 +559,12 @@ class AudioRouter:
 
     def push(self, pcm: bytes):
         for sink in self.sinks:
-            sink.put(pcm)
+            if sink.device_id not in self._failed_sinks:
+                try:
+                    sink.put(pcm)
+                except PlaybackError as exc:
+                    self._failed_sinks[sink.device_id] = exc
+                    sink.abort()
 
     def abort(self):
         for sink in self.sinks:
@@ -476,14 +574,14 @@ class AudioRouter:
         if self._closed:
             return
         self._closed = True
-        first_error: Exception | None = None
+        errors = list(self._failed_sinks.values()) if drain else []
         for sink in self.sinks:
             try:
-                sink.close(drain=drain)
-            except Exception as exc:
-                first_error = first_error or exc
-        if first_error is not None:
-            raise first_error
+                sink.close(drain=drain and sink.device_id not in self._failed_sinks)
+            except PlaybackError as exc:
+                errors.append(exc)
+        if errors:
+            raise PlaybackError("；".join(str(error) for error in errors))
 
 
 def _stable_cable_device(

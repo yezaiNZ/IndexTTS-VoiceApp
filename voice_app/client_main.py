@@ -51,6 +51,7 @@ from .http_errors import check_response
 from .lifecycle import BackendOwnership
 from .model_manifest import MANIFEST_VERSION
 from .processes import external_program, independent_environment
+from .third_party import show_third_party
 
 APP_NAME = "IndexTTSVoiceApp"
 PORT = 7862
@@ -426,6 +427,10 @@ class SetupDialog(QDialog):
         )
         license_link.setOpenExternalLinks(True)
         card_layout.addWidget(license_link)
+        third_party_button = QPushButton("第三方组件、许可与源码")
+        third_party_button.setObjectName("thirdPartyLicenses")
+        third_party_button.clicked.connect(lambda: show_third_party(self))
+        card_layout.addWidget(third_party_button)
         layout.addWidget(card)
         self.stage = QLabel("准备安装；无需另行安装 Python 或 IndexTTS")
         layout.addWidget(self.stage)
@@ -779,7 +784,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--verify-install", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--reference-audio", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--verify-frontend", type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
+    if args.verify_frontend:
+        from .third_party import verify_frontend
+
+        return verify_frontend(args.verify_frontend)
     if args.verify_install:
         if not args.data_dir:
             parser.error("--verify-install requires an isolated --data-dir")

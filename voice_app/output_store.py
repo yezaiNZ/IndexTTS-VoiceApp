@@ -195,7 +195,7 @@ class AudioRecording:
         except OSError as exc:
             self._discard(f"自动保存失败：{exc}")
 
-    def finish(self, complete: bool) -> dict:
+    def finish(self, complete: bool, *, playback_error: str | None = None) -> dict:
         removed = 0
         saved = False
         if not complete or self.bytes_written == 0:
@@ -221,5 +221,7 @@ class AudioRecording:
             "error": self.error,
             "removed_count": removed,
         }
+        if playback_error:
+            result["playback_error"] = playback_error
         self.store.remember(self.job_id, result)
         return result
